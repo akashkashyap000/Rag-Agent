@@ -1,8 +1,11 @@
-"""Document Q&A: a Retrieval-Augmented Generation (RAG) app built with Streamlit.
+"""Document Assistant: a Retrieval-Augmented Generation (RAG) app built with Streamlit.
 
 Pipeline:
     PDFs -> chunks -> embeddings -> Chroma vector store
     question -> MMR retrieval -> prompt (context + history) -> Groq LLM -> streamed answer
+
+Casual messages (greetings, thanks, goodbyes) are detected up front and answered
+directly, without retrieval.
 
 The vector store is loaded from ./chroma_db. If it is missing or empty, it is
 rebuilt once from the PDFs in the Data folder.
@@ -12,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -64,6 +68,9 @@ class Settings:
 
 SETTINGS = Settings()
 
+USER_AVATAR = ":material/person:"
+ASSISTANT_AVATAR = ":material/smart_toy:"
+
 EXAMPLE_QUESTIONS = (
     "What is a JOIN in SQL?",
     "What is machine learning?",
@@ -71,9 +78,10 @@ EXAMPLE_QUESTIONS = (
     "What is prompt engineering?",
 )
 
-PROMPT_TEMPLATE = """You are a helpful assistant answering questions based ONLY on the provided context.
+RAG_PROMPT = """You are a helpful assistant answering questions based ONLY on the provided context.
 If the answer is not in the context, say "I don't have enough information in my documents to answer this."
 Do not make up information. Keep the answer clear and well organised.
+Do not use emojis.
 
 Chat history (for follow-up questions):
 {history}
@@ -85,20 +93,68 @@ Question: {question}
 
 Answer:"""
 
+SMALLTALK_PROMPT = """You are a polite, professional assistant for a document question answering tool.
+The user sent a casual message such as a greeting, thanks or goodbye.
+Reply in one or two short sentences. Do not use emojis.
+- If it is a greeting or a "how are you" style message, greet back warmly and mention that you can answer questions about these documents: {topics}.
+- If it is a thank-you or a goodbye, respond courteously.
+- If they ask who you are or what you can do, explain that you answer questions using the indexed documents and show the sources.
+
+Chat history:
+{history}
+
+User message: {question}
+
+Reply:"""
+
+# Phrases treated as casual conversation. A message is casual only if it is made
+# up entirely of these phrases (so "hey what is ML" still goes through retrieval).
+SMALLTALK_PHRASES = (
+    "good morning", "good afternoon", "good evening", "good night",
+    "whats up", "what is up", "wassup", "sup",
+    "how are you doing", "how are you", "how r u", "how is it going", "hows it going",
+    "how do you do", "hello", "hi", "hey", "yo", "hola", "namaste",
+    "thank you", "thanks", "thx", "very much", "so much", "a lot",
+    "okay", "ok", "cool", "nice", "great", "got it",
+    "goodbye", "bye", "see you", "see ya",
+    "who are you", "what are you", "what can you do", "help me", "help",
+    "there", "bro", "buddy", "man", "everyone", "team", "again", "please",
+)
+_UNIT = "|".join(re.escape(p) for p in sorted(SMALLTALK_PHRASES, key=len, reverse=True))
+SMALLTALK_RE = re.compile(rf"^(?:{_UNIT})(?:\s+(?:{_UNIT}))*$")
+
 PAGE_CSS = """
 <style>
-.block-container {padding-top: 2rem; max-width: 820px;}
-.hero {
-    padding: 1.4rem 1.6rem; border-radius: 16px; margin-bottom: 1rem;
-    background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%); color: #fff;
+#MainMenu, footer {visibility: hidden;}
+.block-container {padding-top: 2.2rem; max-width: 820px;}
+
+.app-header {
+    padding-bottom: 1rem; margin-bottom: 1.25rem;
+    border-bottom: 1px solid rgba(128, 128, 128, 0.3);
 }
-.hero h1 {margin: 0; font-size: 2rem; color: #fff;}
-.hero p {margin: .3rem 0 0 0; opacity: .9;}
-div[data-testid="stChatMessage"] {border-radius: 14px;}
+.app-header h1 {
+    margin: 0; font-size: 1.7rem; font-weight: 600; letter-spacing: -0.01em;
+}
+.app-header p {
+    margin: 0.3rem 0 0 0; font-size: 0.95rem; color: rgba(150, 150, 150, 1);
+}
+
+div[data-testid="stChatMessage"] {
+    border: 1px solid rgba(128, 128, 128, 0.2);
+    border-radius: 10px;
+    padding: 0.9rem 1rem;
+    margin-bottom: 0.6rem;
+}
+div[data-testid="stButton"] button {border-radius: 8px; font-weight: 500;}
+section[data-testid="stSidebar"] h2, section[data-testid="stSidebar"] h3 {
+    font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.06em;
+    color: rgba(150, 150, 150, 1);
+}
+.welcome {color: rgba(150, 150, 150, 1); margin-bottom: 1rem;}
 </style>
-<div class="hero">
-    <h1>Document Q&amp;A</h1>
-    <p>Ask anything from my PDFs. Answers come only from the documents, with sources.</p>
+<div class="app-header">
+    <h1>Document Assistant</h1>
+    <p>Answers are generated only from the indexed documents and include their sources.</p>
 </div>
 """
 
@@ -182,12 +238,37 @@ def load_llm(api_key: str):
     return make(SETTINGS.primary_llm).with_fallbacks([make(SETTINGS.fallback_llm)])
 
 
+def list_documents() -> list[str]:
+    """Return the names of the indexed PDFs (without extension)."""
+    data_dir = SETTINGS.data_dir
+    if not data_dir.is_dir():
+        return []
+    return sorted(pdf.stem for pdf in data_dir.glob("*.pdf"))
+
+
 # --------------------------------------------------------------------------- #
 # RAG helpers
 # --------------------------------------------------------------------------- #
-def build_chain(llm):
-    """Compose the answer chain: prompt -> LLM -> plain string."""
-    return ChatPromptTemplate.from_template(PROMPT_TEMPLATE) | llm | StrOutputParser()
+def build_chains(llm):
+    """Return the (RAG chain, small-talk chain) pair. Both emit plain strings."""
+    parser = StrOutputParser()
+    rag_chain = ChatPromptTemplate.from_template(RAG_PROMPT) | llm | parser
+    smalltalk_chain = ChatPromptTemplate.from_template(SMALLTALK_PROMPT) | llm | parser
+    return rag_chain, smalltalk_chain
+
+
+def normalize(text: str) -> str:
+    """Lowercase, drop punctuation and collapse stretched letters ('heyyy' -> 'hey')."""
+    text = text.lower().replace("'", "")
+    text = re.sub(r"[^a-z\s]", " ", text)
+    text = re.sub(r"(.)\1{2,}", r"\1", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def is_small_talk(text: str) -> bool:
+    """True if the message is purely a greeting, thanks, goodbye or similar."""
+    cleaned = normalize(text)
+    return bool(cleaned) and SMALLTALK_RE.fullmatch(cleaned) is not None
 
 
 def retrieve(vectorstore: Chroma, question: str, top_k: int) -> list[Document]:
@@ -233,116 +314,4 @@ def init_state() -> None:
 
 
 def render_sidebar(vectorstore: Chroma) -> int:
-    """Draw the sidebar and return the selected number of chunks to retrieve."""
-    with st.sidebar:
-        st.header("Settings")
-        top_k = st.slider(
-            "Chunks to retrieve", 3, 10, 6,
-            help="More chunks give more context but a slower answer.",
-        )
-        if st.button("Clear chat", width="stretch"):
-            st.session_state.messages = []
-            st.session_state.pending_question = None
-            st.rerun()
-
-        st.divider()
-        st.subheader("Knowledge base")
-        st.caption(f"{vectorstore._collection.count()} text chunks indexed")
-        data_dir = SETTINGS.data_dir
-        if data_dir.is_dir():
-            for pdf_path in sorted(data_dir.glob("*.pdf")):
-                st.markdown(f"- {pdf_path.stem}")
-    return top_k
-
-
-def render_sources(sources: list[str]) -> None:
-    if not sources:
-        return
-    with st.expander(f"Sources ({len(sources)})"):
-        for source in sources:
-            st.markdown(f"- {source}")
-
-
-def render_examples() -> None:
-    """Show clickable example questions on an empty chat."""
-    st.markdown("**Try one of these:**")
-    columns = st.columns(2)
-    for index, question in enumerate(EXAMPLE_QUESTIONS):
-        if columns[index % 2].button(question, key=f"example_{index}", width="stretch"):
-            st.session_state.pending_question = question
-            st.rerun()
-
-
-def render_history() -> None:
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-            render_sources(message.get("sources", []))
-
-
-def handle_question(question: str, vectorstore: Chroma, chain, top_k: int) -> None:
-    """Retrieve context, stream the answer, and store the exchange in history."""
-    history = format_history(st.session_state.messages)
-    st.session_state.messages.append({"role": "user", "content": question})
-    with st.chat_message("user"):
-        st.markdown(question)
-
-    sources: list[str] = []
-    with st.chat_message("assistant"):
-        try:
-            with st.spinner("Searching documents..."):
-                docs = retrieve(vectorstore, question, top_k)
-                sources = extract_sources(docs)
-
-            answer = st.write_stream(
-                chain.stream(
-                    {
-                        "context": format_docs(docs),
-                        "question": question,
-                        "history": history,
-                    }
-                )
-            )
-        except Exception as exc:
-            logger.exception("Failed to answer question")
-            answer = f"Error: {exc}"
-            st.error(answer)
-            sources = []
-        render_sources(sources)
-
-    st.session_state.messages.append(
-        {"role": "assistant", "content": answer, "sources": sources}
-    )
-
-
-# --------------------------------------------------------------------------- #
-# Entry point
-# --------------------------------------------------------------------------- #
-def main() -> None:
-    st.set_page_config(page_title="Document Q&A", layout="centered")
-    st.markdown(PAGE_CSS, unsafe_allow_html=True)
-
-    api_key = require_api_key()
-    vectorstore = load_vectorstore()
-    if vectorstore is None:
-        st.error("No chroma_db and no PDFs found. Add your PDFs to the Data folder.")
-        st.stop()
-
-    chain = build_chain(load_llm(api_key))
-    init_state()
-    top_k = render_sidebar(vectorstore)
-
-    if not st.session_state.messages:
-        render_examples()
-    render_history()
-
-    question = st.chat_input("Ask a question about the documents")
-    if st.session_state.pending_question:
-        question = st.session_state.pending_question
-        st.session_state.pending_question = None
-
-    if question:
-        handle_question(question, vectorstore, chain, top_k)
-
-
-main()
+    """Draw the sidebar and return the selected number
