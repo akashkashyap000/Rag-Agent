@@ -121,7 +121,7 @@ SMALLTALK_PHRASES = (
     "there", "bro", "buddy", "man", "everyone", "team", "again", "please",
 )
 _UNIT = "|".join(re.escape(p) for p in sorted(SMALLTALK_PHRASES, key=len, reverse=True))
-SMALLTALK_RE = re.compile(rf"^(?:{_UNIT})(?:\s+(?:{_UNIT}))*$")
+SMALLTALK_RE = re.compile(rf"(?:{_UNIT})(?:\s+(?:{_UNIT}))*")
 
 PAGE_CSS = """
 <style>
@@ -314,4 +314,133 @@ def init_state() -> None:
 
 
 def render_sidebar(vectorstore: Chroma) -> int:
-    """Draw the sidebar and return the selected number
+    """Draw the sidebar and return the selected number of chunks to retrieve."""
+    with st.sidebar:
+        st.subheader("Configuration")
+        top_k = st.slider(
+            "Retrieval depth", 3, 10, 6,
+            help="Number of document chunks used as context. Higher values give "
+                 "more context but a slower answer.",
+        )
+        if st.button("Clear conversation", width="stretch"):
+            st.session_state.messages = []
+            st.session_state.pending_question = None
+            st.rerun()
+
+        st.divider()
+        st.subheader("Knowledge base")
+        st.caption(f"{vectorstore._collection.count()} text chunks indexed")
+        for name in list_documents():
+            st.markdown(f"- {name}")
+    return top_k
+
+
+def render_sources(sources: list[str]) -> None:
+    if not sources:
+        return
+    with st.expander(f"Sources ({len(sources)})"):
+        for source in sources:
+            st.markdown(f"- {source}")
+
+
+def render_examples() -> None:
+    """Show welcome text and clickable example questions on an empty chat."""
+    st.markdown(
+        '<div class="welcome">Ask a question about the indexed documents, '
+        "or pick one of the suggestions below.</div>",
+        unsafe_allow_html=True,
+    )
+    columns = st.columns(2)
+    for index, question in enumerate(EXAMPLE_QUESTIONS):
+        if columns[index % 2].button(question, key=f"example_{index}", width="stretch"):
+            st.session_state.pending_question = question
+            st.rerun()
+
+
+def render_history() -> None:
+    for message in st.session_state.messages:
+        avatar = USER_AVATAR if message["role"] == "user" else ASSISTANT_AVATAR
+        with st.chat_message(message["role"], avatar=avatar):
+            st.markdown(message["content"])
+            render_sources(message.get("sources", []))
+
+
+def handle_question(
+    question: str,
+    vectorstore: Chroma,
+    rag_chain,
+    smalltalk_chain,
+    top_k: int,
+) -> None:
+    """Answer a message and store the exchange in the chat history."""
+    history = format_history(st.session_state.messages)
+    st.session_state.messages.append({"role": "user", "content": question})
+    with st.chat_message("user", avatar=USER_AVATAR):
+        st.markdown(question)
+
+    sources: list[str] = []
+    with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
+        try:
+            if is_small_talk(question):
+                stream = smalltalk_chain.stream(
+                    {
+                        "topics": ", ".join(list_documents()) or "the indexed documents",
+                        "history": history,
+                        "question": question,
+                    }
+                )
+            else:
+                with st.spinner("Searching documents..."):
+                    docs = retrieve(vectorstore, question, top_k)
+                    sources = extract_sources(docs)
+                stream = rag_chain.stream(
+                    {
+                        "context": format_docs(docs),
+                        "question": question,
+                        "history": history,
+                    }
+                )
+            answer = st.write_stream(stream)
+        except Exception as exc:
+            logger.exception("Failed to answer question")
+            answer = f"Error: {exc}"
+            st.error(answer)
+            sources = []
+        render_sources(sources)
+
+    st.session_state.messages.append(
+        {"role": "assistant", "content": answer, "sources": sources}
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+def main() -> None:
+    st.set_page_config(page_title="Document Assistant", layout="centered")
+    st.markdown(PAGE_CSS, unsafe_allow_html=True)
+
+    api_key = require_api_key()
+    vectorstore = load_vectorstore()
+    if vectorstore is None:
+        st.error("No chroma_db and no PDFs found. Add your PDFs to the Data folder.")
+        st.stop()
+
+    rag_chain, smalltalk_chain = build_chains(load_llm(api_key))
+    init_state()
+    top_k = render_sidebar(vectorstore)
+
+    if not st.session_state.messages:
+        render_examples()
+    render_history()
+
+    question = st.chat_input("Ask a question about the documents")
+    if st.session_state.pending_question:
+        question = st.session_state.pending_question
+        st.session_state.pending_question = None
+
+    if question:
+        handle_question(question, vectorstore, rag_chain, smalltalk_chain, top_k)
+
+
+main()
