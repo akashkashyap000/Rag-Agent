@@ -50,7 +50,8 @@ class Settings:
     temperature: float = 0.2
     chunk_size: int = 1000
     chunk_overlap: int = 150
-    history_turns: int = 4
+    history_turns: int = 6
+    history_chars: int = 600
 
     @property
     def db_path(self) -> str:
@@ -83,15 +84,34 @@ If the answer is not in the context, say "I don't have enough information in my 
 Do not make up information. Keep the answer clear and well organised.
 Do not use emojis.
 
+If the question mentions marks, match the depth of the answer to it:
+- 2 marks: a short definition in 2 to 3 lines.
+- 5 marks: a structured explanation with a few key points.
+- 10 marks: a detailed answer with an introduction, headings, key points, examples from the context and a short conclusion.
+If it asks for a detailed answer, give a thorough, well structured explanation.
+
 Chat history (for follow-up questions):
 {history}
 
 Context:
 {context}
 
-Question: {question}
+User message: {question}
+Interpreted as: {standalone}
 
 Answer:"""
+
+CONDENSE_PROMPT = """Rewrite the follow-up message as one standalone question, using the chat history to fill in what it refers to.
+Keep any instructions about length or format, such as "for 10 marks" or "in detail".
+If the message is already a complete standalone question, return it unchanged.
+Output only the rewritten question, with no explanation.
+
+Chat history:
+{history}
+
+Follow-up message: {question}
+
+Standalone question:"""
 
 SMALLTALK_PROMPT = """You are a polite, professional assistant for a document question answering tool.
 The user sent a casual message such as a greeting, thanks or goodbye.
@@ -250,11 +270,28 @@ def list_documents() -> list[str]:
 # RAG helpers
 # --------------------------------------------------------------------------- #
 def build_chains(llm):
-    """Return the (RAG chain, small-talk chain) pair. Both emit plain strings."""
+    """Return the (RAG, small-talk, condense) chains. All emit plain strings."""
     parser = StrOutputParser()
     rag_chain = ChatPromptTemplate.from_template(RAG_PROMPT) | llm | parser
     smalltalk_chain = ChatPromptTemplate.from_template(SMALLTALK_PROMPT) | llm | parser
-    return rag_chain, smalltalk_chain
+    condense_chain = ChatPromptTemplate.from_template(CONDENSE_PROMPT) | llm | parser
+    return rag_chain, smalltalk_chain, condense_chain
+
+
+def condense_question(condense_chain, question: str, history: str) -> str:
+    """Turn a follow-up ("for 10 marks") into a standalone question for retrieval.
+
+    Falls back to the original text if there is no history or the call fails.
+    """
+    if history == "None":
+        return question
+    try:
+        rewritten = condense_chain.invoke({"history": history, "question": question})
+    except Exception:
+        logger.exception("Could not condense question")
+        return question
+    rewritten = rewritten.strip().strip('"').strip()
+    return rewritten or question
 
 
 def normalize(text: str) -> str:
@@ -299,8 +336,9 @@ def format_history(messages: list[dict]) -> str:
     recent = messages[-SETTINGS.history_turns :]
     if not recent:
         return "None"
+    limit = SETTINGS.history_chars
     return "\n".join(
-        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
+        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:limit]}"
         for m in recent
     )
 
@@ -335,10 +373,12 @@ def render_sidebar(vectorstore: Chroma) -> int:
     return top_k
 
 
-def render_sources(sources: list[str]) -> None:
+def render_sources(sources: list[str], query: str = "") -> None:
     if not sources:
         return
     with st.expander(f"Sources ({len(sources)})"):
+        if query:
+            st.caption(f"Searched for: {query}")
         for source in sources:
             st.markdown(f"- {source}")
 
@@ -362,7 +402,7 @@ def render_history() -> None:
         avatar = USER_AVATAR if message["role"] == "user" else ASSISTANT_AVATAR
         with st.chat_message(message["role"], avatar=avatar):
             st.markdown(message["content"])
-            render_sources(message.get("sources", []))
+            render_sources(message.get("sources", []), message.get("query", ""))
 
 
 def handle_question(
@@ -370,6 +410,7 @@ def handle_question(
     vectorstore: Chroma,
     rag_chain,
     smalltalk_chain,
+    condense_chain,
     top_k: int,
 ) -> None:
     """Answer a message and store the exchange in the chat history."""
@@ -379,6 +420,7 @@ def handle_question(
         st.markdown(question)
 
     sources: list[str] = []
+    standalone = ""
     with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
         try:
             if is_small_talk(question):
@@ -391,12 +433,14 @@ def handle_question(
                 )
             else:
                 with st.spinner("Searching documents..."):
-                    docs = retrieve(vectorstore, question, top_k)
+                    standalone = condense_question(condense_chain, question, history)
+                    docs = retrieve(vectorstore, standalone, top_k)
                     sources = extract_sources(docs)
                 stream = rag_chain.stream(
                     {
                         "context": format_docs(docs),
                         "question": question,
+                        "standalone": standalone,
                         "history": history,
                     }
                 )
@@ -406,10 +450,16 @@ def handle_question(
             answer = f"Error: {exc}"
             st.error(answer)
             sources = []
-        render_sources(sources)
+        shown_query = standalone if standalone.lower() != question.lower() else ""
+        render_sources(sources, shown_query)
 
     st.session_state.messages.append(
-        {"role": "assistant", "content": answer, "sources": sources}
+        {
+            "role": "assistant",
+            "content": answer,
+            "sources": sources,
+            "query": shown_query,
+        }
     )
 
 
@@ -426,7 +476,7 @@ def main() -> None:
         st.error("No chroma_db and no PDFs found. Add your PDFs to the Data folder.")
         st.stop()
 
-    rag_chain, smalltalk_chain = build_chains(load_llm(api_key))
+    rag_chain, smalltalk_chain, condense_chain = build_chains(load_llm(api_key))
     init_state()
     top_k = render_sidebar(vectorstore)
 
@@ -440,7 +490,9 @@ def main() -> None:
         st.session_state.pending_question = None
 
     if question:
-        handle_question(question, vectorstore, rag_chain, smalltalk_chain, top_k)
+        handle_question(
+            question, vectorstore, rag_chain, smalltalk_chain, condense_chain, top_k
+        )
 
 
 main()
